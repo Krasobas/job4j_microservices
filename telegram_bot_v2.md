@@ -112,8 +112,11 @@ public class MyBot extends TelegramLongPollingBot {
 
     @Override
     public void onUpdateReceived(Update update) {
-        // вся логика здесь
-        execute(new SendMessage(...)); // вызов через наследование
+        if (update.hasMessage() && update.getMessage().hasText()) {
+            var chatId = update.getMessage().getChatId().toString();
+            var text = update.getMessage().getText();
+            execute(new SendMessage(chatId, "Эхо: " + text)); // вызов через наследование
+        }
     }
 }
 ```
@@ -151,8 +154,17 @@ public class MyBot implements SpringLongPollingBot,
 
     @Override
     public void consume(Update update) {
-        // вся логика здесь
-        telegramClient.execute(new SendMessage(...));
+        if (update.hasMessage() && update.getMessage().hasText()) {
+            var chatId = update.getMessage().getChatId().toString();
+            var text = update.getMessage().getText();
+            try {
+                telegramClient.execute(
+                        new SendMessage(chatId, "Эхо: " + text)
+                );
+            } catch (TelegramApiException e) {
+                e.printStackTrace();
+            }
+        }
     }
 }
 ```
@@ -163,6 +175,207 @@ public class MyBot implements SpringLongPollingBot,
 - `TelegramClient` — отдельный объект для отправки сообщений, вместо унаследованного `execute()`
 - Токен инъектируется через `@Value`
 - Точка входа — метод `consume(Update)` вместо `onUpdateReceived(Update)`
+
+### Почему в примере echo-бот?
+
+Оба примера выше — это echo-бот: бот получает сообщение и отправляет его обратно. Как эхо в горах — крикнул «привет», получил «привет» в ответ. Это стандартный «hello world» в мире Telegram-ботов: если эхо работает — значит токен правильный, сообщения приходят и уходят.
+
+`SendMessage` — это объект, описывающий одно исходящее текстовое сообщение. Конструктор принимает два параметра: кому (`chatId`) и что (`text`). Вызов `telegramClient.execute(sendMessage)` — это HTTP-запрос к Telegram API, который доставляет сообщение пользователю.
+
+Но `consume()` — это точка входа для **всех** обновлений от Telegram, а не только текстовых. Вот что ещё можно делать внутри:
+
+- **Отправлять кнопки.** `SendMessage` можно снабдить `ReplyKeyboardMarkup` (кнопки внизу экрана) или `InlineKeyboardMarkup` (кнопки прямо в сообщении).
+- **Отправлять фото, документы, стикеры.** Вместо `SendMessage` используются `SendPhoto`, `SendDocument`, `SendSticker` — всё тот же `telegramClient.execute()`, просто другой объект.
+- **Обрабатывать callback от inline-кнопок.** Когда пользователь нажимает inline-кнопку, приходит не `message`, а `callbackQuery`. Его тоже проверяют в `consume()` через `update.hasCallbackQuery()`.
+- **Маршрутизировать команды.** Именно этим мы займёмся дальше — вместо `if-else` на каждую команду вынесем логику в отдельные классы `Action`.
+
+В нашем уроке echo-бот нужен ровно для одной цели — показать минимальный рабочий пример в блоке «было/стало», чтобы была видна разница между `this.execute()` и `telegramClient.execute()`. Дальше мы строим бота по-настоящему — через `Action` и карту команд.
+
+---
+
+## Шаг 3.1: Разбираем интерфейсы — что зачем
+
+Может показаться странным: зачем два интерфейса, если бот — это «один класс»? Давайте разберёмся, какую роль играет каждый из них и какие есть альтернативы.
+
+### SpringLongPollingBot — интеграция со Spring
+
+Этот интерфейс нужен **только** для автоматической регистрации бота через Spring Boot Starter. Его контракт минимален:
+
+```java
+public interface SpringLongPollingBot {
+    String getBotToken();
+    LongPollingUpdateConsumer getUpdatesConsumer();
+}
+```
+
+«Дай мне токен и скажи, кто будет обрабатывать обновления» — вот и весь контракт. При старте приложения Spring Boot Starter находит все бины типа `SpringLongPollingBot` и регистрирует их автоматически.
+
+Альтернативы у этого интерфейса нет — если хочешь автоматическую регистрацию через Spring, реализуешь `SpringLongPollingBot`. Если Spring не используешь — регистрируешь бота вручную через `TelegramBotsLongPollingApplication.registerBot(token, consumer)`, и тогда `SpringLongPollingBot` не нужен вообще.
+
+### LongPollingUpdateConsumer — как получать обновления
+
+`getUpdatesConsumer()` должен вернуть `LongPollingUpdateConsumer`. Это базовый интерфейс с одним методом:
+
+```java
+public interface LongPollingUpdateConsumer {
+    void consume(List<Update> updates);  // получает ПАЧКУ обновлений
+}
+```
+
+Telegram присылает обновления пачками (до 100 штук за один запрос). Базовый интерфейс отдаёт весь список. И вот тут развилка:
+
+### Вариант 1: LongPollingSingleThreadUpdateConsumer (простой)
+
+Это **утилитный интерфейс**, который разворачивает список за вас:
+
+```java
+public interface LongPollingSingleThreadUpdateConsumer
+        extends LongPollingUpdateConsumer {
+
+    void consume(Update update);  // ОДНО обновление
+
+    @Override
+    default void consume(List<Update> updates) {
+        updates.forEach(this::consume);  // просто цикл
+    }
+}
+```
+
+Он реализует `consume(List<Update>)` за вас — проходит по списку и для каждого элемента вызывает `consume(Update)` с одним обновлением. Всё последовательно, в одном потоке. Это самый простой вариант, и он подходит для подавляющего большинства ботов.
+
+**Когда использовать:** обычный бот, учебный проект, небольшая нагрузка. Порядок обработки сообщений гарантирован.
+
+### Вариант 2: LongPollingUpdateConsumer напрямую (продвинутый)
+
+Если вам нужна параллельная обработка — реализуйте базовый интерфейс напрямую:
+
+```java
+@Component
+public class HighLoadBot implements SpringLongPollingBot,
+                                    LongPollingUpdateConsumer {
+
+    private final ExecutorService executor =
+            Executors.newVirtualThreadPerTaskExecutor();
+    private final TelegramClient telegramClient;
+    private final String token;
+
+    public HighLoadBot(@Value("${telegram.bot.token}") String token) {
+        this.token = token;
+        this.telegramClient = new OkHttpTelegramClient(token);
+    }
+
+    @Override
+    public String getBotToken() {
+        return token;
+    }
+
+    @Override
+    public LongPollingUpdateConsumer getUpdatesConsumer() {
+        return this;
+    }
+
+    @Override
+    public void consume(List<Update> updates) {
+        for (Update update : updates) {
+            executor.submit(() -> processUpdate(update));
+        }
+    }
+
+    private void processUpdate(Update update) {
+        // обработка в отдельном виртуальном потоке
+    }
+}
+```
+
+Здесь каждое обновление обрабатывается в отдельном виртуальном потоке (Java 21+). Вы сами управляете параллельностью и порядком обработки.
+
+**Когда использовать:** высоконагруженный бот с тысячами сообщений в секунду, нужна параллельная обработка, группировка или фильтрация пачкой.
+
+### Итого по интерфейсам
+
+```
+SpringLongPollingBot                    ← «зарегистрируй меня в Spring»
+  └─ getBotToken()
+  └─ getUpdatesConsumer() → возвращает:
+        │
+        ├─ LongPollingUpdateConsumer           ← consume(List<Update>)
+        │    пачка обновлений, сам решаешь     ← для продвинутых
+        │
+        └─ LongPollingSingleThreadUpdateConsumer ← consume(Update)
+             по одному, последовательно         ← для большинства ботов ✅
+```
+
+В нашем уроке мы используем `LongPollingSingleThreadUpdateConsumer`, потому что для учебного бота с картой команд это идеальный выбор — обновления приходят по одному, обрабатываются последовательно, никаких гонок данных.
+
+---
+
+## Шаг 3.2: Бот = один класс. Остальное — ваша архитектура
+
+Важно понять: **с точки зрения библиотеки TelegramBots, бот — это один-единственный класс**, который реализует два интерфейса и три метода (`getBotToken`, `getUpdatesConsumer`, `consume`). Всё.
+
+Всё остальное — `Action`, карты команд, `bindingBy`, сервисы, базы данных — это уже **ваша** архитектура приложения. Библиотеке до этого дела нет. Она просто вызывает `consume()` каждый раз, когда приходит обновление от Telegram, а что вы внутри делаете — ваше решение.
+
+Аналогия со Spring MVC: `DispatcherServlet` — это тоже «один класс», точка входа для всех HTTP-запросов. А контроллеры, сервисы, репозитории — детали приложения. Наш `TrackerBot.consume()` играет ту же роль — принимает входящее событие и маршрутизирует его дальше.
+
+---
+
+## Шаг 3.3: Меню команд в Telegram
+
+Вы наверняка видели у ботов кнопку **«/»** (или иконку меню) рядом с полем ввода — при нажатии выпадает список доступных команд. Это не магия — это нужно настроить. Есть два способа.
+
+### Способ 1: Через BotFather (вручную)
+
+Отправьте `/setcommands` в чат с @BotFather, выберите бота и введите список:
+
+```
+start - Начало работы
+help - Список команд
+new - Регистрация пользователя
+```
+
+Просто и быстро, но есть минус: при добавлении новой команды в код нужно не забыть обновить список и в BotFather. Забудете — пользователи не увидят новую команду в меню.
+
+### Способ 2: Через код (программно) ✅
+
+Правильнее регистрировать команды при старте бота — тогда меню обновляется автоматически при каждом деплое:
+
+```java
+import org.telegram.telegrambots.longpolling.BotSession;
+import org.telegram.telegrambots.longpolling.starter.AfterBotRegistration;
+import org.telegram.telegrambots.meta.api.methods.commands.SetMyCommands;
+import org.telegram.telegrambots.meta.api.objects.commands.BotCommand;
+import org.telegram.telegrambots.meta.api.objects.commands.scope.BotCommandScopeDefault;
+```
+
+```java
+@AfterBotRegistration
+public void afterRegistration(BotSession botSession) {
+    try {
+        telegramClient.execute(new SetMyCommands(
+                List.of(
+                        new BotCommand("/start", "Начало работы"),
+                        new BotCommand("/help", "Список команд"),
+                        new BotCommand("new", "Регистрация пользователя")
+                ),
+                new BotCommandScopeDefault(),
+                null  // languageCode — null означает «для всех языков»
+        ));
+        log.info("Команды меню установлены");
+    } catch (TelegramApiException e) {
+        log.error("Ошибка установки команд меню", e);
+    }
+}
+```
+
+Этот метод добавляется прямо в класс бота (`TrackerBot`). Разберём по частям:
+
+- `@AfterBotRegistration` — аннотация из Spring Boot Starter TelegramBots. Метод вызывается **один раз**, сразу после того, как бот зарегистрирован и сессия с Telegram активна. Это гарантия, что `telegramClient` уже работает.
+- `SetMyCommands` — запрос к Telegram API, который устанавливает список команд для меню.
+- `BotCommand("/start", "Начало работы")` — одна команда: первый аргумент — текст команды, второй — описание, которое видит пользователь в меню.
+- `BotCommandScopeDefault()` — команды видны **всем** пользователям во **всех** чатах. Можно настроить и точнее: `BotCommandScopeChat` — для конкретного чата, `BotCommandScopeAllGroupChats` — только для групповых чатов, и т.д.
+- `null` (languageCode) — команды одинаковые для всех языков. Можно вызвать `SetMyCommands` несколько раз с разными `languageCode`, чтобы русскоязычные пользователи видели описания на русском, а англоязычные — на английском.
+
+> В нашем уроке мы используем второй способ. Полный код `TrackerBot` с меню будет показан в Шаге 5.
 
 ---
 
@@ -181,6 +394,18 @@ import org.telegram.telegrambots.meta.generics.TelegramClient;
 public interface Action {
 
     /**
+     * Имя команды, по которому Action регистрируется в карте.
+     * Например: "/start", "New", "/help"
+     */
+    String commandName();
+
+    /**
+     * Описание команды для меню Telegram.
+     * Пользователь увидит его рядом с командой при нажатии на кнопку «/».
+     */
+    String description();
+
+    /**
      * Вызывается, когда пользователь выбирает команду
      * (например, нажимает кнопку или вводит "/start").
      */
@@ -194,7 +419,13 @@ public interface Action {
 }
 ```
 
-> В оригинальном уроке интерфейс `Action` был привязан к `execute()` через наследование. Теперь мы передаём `TelegramClient` как параметр — это делает `Action` легко тестируемым: в тестах можно подставить мок.
+Четыре метода — четыре ответственности:
+- `commandName()` — **идентификация**: как бот найдёт этот Action в карте команд. Именно по этому значению `TrackerBot` автоматически строит `Map<String, Action>` из всех Spring-бинов.
+- `description()` — **описание для меню**: текст, который пользователь видит в меню команд Telegram. Используется в `@AfterBotRegistration` для автоматической регистрации меню.
+- `handle()` — **реакция на команду**: пользователь ввёл `/start` или нажал кнопку «New».
+- `callback()` — **реакция на ввод**: пользователь ответил на вопрос бота (например, ввёл email после команды «New»).
+
+> В оригинальном уроке интерфейс `Action` имел только `handle()` и `callback()`, а карта команд заполнялась вручную. Мы добавили `commandName()`, чтобы Spring DI мог автоматически собрать карту из всех бинов `Action` — без ручной регистрации. `TelegramClient` передаётся как параметр вместо доступа через наследование — это делает `Action` легко тестируемым: в тестах можно подставить мок.
 
 ### Две карты
 
@@ -256,11 +487,16 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.telegram.telegrambots.client.okhttp.OkHttpTelegramClient;
+import org.telegram.telegrambots.longpolling.BotSession;
 import org.telegram.telegrambots.longpolling.interfaces.LongPollingUpdateConsumer;
+import org.telegram.telegrambots.longpolling.starter.AfterBotRegistration;
 import org.telegram.telegrambots.longpolling.starter.SpringLongPollingBot;
 import org.telegram.telegrambots.longpolling.util.LongPollingSingleThreadUpdateConsumer;
+import org.telegram.telegrambots.meta.api.methods.commands.SetMyCommands;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
 import org.telegram.telegrambots.meta.api.objects.Update;
+import org.telegram.telegrambots.meta.api.objects.commands.BotCommand;
+import org.telegram.telegrambots.meta.api.objects.commands.scope.BotCommandScopeDefault;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 import org.telegram.telegrambots.meta.generics.TelegramClient;
 import ru.job4j.bot.action.Action;
@@ -346,6 +582,25 @@ public class TrackerBot implements SpringLongPollingBot,
             log.error("Ошибка отправки сообщения в чат {}", chatId, e);
         }
     }
+
+    /**
+     * Устанавливает меню команд в Telegram.
+     * Вызывается один раз после успешной регистрации бота.
+     */
+    @AfterBotRegistration
+    public void afterRegistration(BotSession botSession) {
+        try {
+            var commands = actions.values().stream()
+                    .map(a -> new BotCommand(a.commandName(), a.description()))
+                    .toList();
+            telegramClient.execute(new SetMyCommands(
+                    commands, new BotCommandScopeDefault(), null
+            ));
+            log.info("Команды меню установлены: {}", commands.size());
+        } catch (TelegramApiException e) {
+            log.error("Ошибка установки команд меню", e);
+        }
+    }
 }
 ```
 
@@ -357,39 +612,7 @@ public class TrackerBot implements SpringLongPollingBot,
 
 ---
 
-## Шаг 6: Интерфейс Action (обновлённый)
-
-```java
-package ru.job4j.bot.action;
-
-import org.telegram.telegrambots.meta.api.objects.message.Message;
-import org.telegram.telegrambots.meta.generics.TelegramClient;
-
-public interface Action {
-
-    /**
-     * Имя команды, по которому Action регистрируется в карте.
-     * Например: "/start", "New", "/help"
-     */
-    String commandName();
-
-    /**
-     * Реакция на команду.
-     */
-    void handle(Message message, TelegramClient client);
-
-    /**
-     * Реакция на пользовательский ввод после команды.
-     */
-    void callback(Message message, TelegramClient client);
-}
-```
-
-> Добавлен метод `commandName()` — он используется ботом для автоматического заполнения карты `actions`. В оригинале карта заполнялась вручную.
-
----
-
-## Шаг 7: Практический пример — Регистрация пользователя
+## Шаг 6: Практический пример — Регистрация пользователя
 
 ### RegAction
 
@@ -410,6 +633,11 @@ public class RegAction implements Action {
     @Override
     public String commandName() {
         return "New";
+    }
+
+    @Override
+    public String description() {
+        return "Регистрация пользователя";
     }
 
     @Override
@@ -457,6 +685,11 @@ public class StartAction implements Action {
     }
 
     @Override
+    public String description() {
+        return "Начало работы";
+    }
+
+    @Override
     public void handle(Message message, TelegramClient client) {
         var text = """
                 Добро пожаловать! Доступные команды:
@@ -499,7 +732,7 @@ public class TelegramBotApplication {
 
 ---
 
-## Шаг 8: Демонстрация работы
+## Шаг 7: Демонстрация работы
 
 ```
 Пользователь                    Бот
@@ -572,6 +805,9 @@ telegram-bot/
 public class HelpAction implements Action {
     @Override
     public String commandName() { return "/help"; }
+
+    @Override
+    public String description() { return "Список команд"; }
 
     @Override
     public void handle(Message message, TelegramClient client) {
