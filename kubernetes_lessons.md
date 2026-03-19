@@ -521,22 +521,134 @@ kubectl get all
 
 ### Namespace
 
-Namespace — логическое разделение ресурсов в кластере. По умолчанию:
-- `default` — ваши ресурсы, если namespace не указан.
-- `kube-system` — компоненты самого Kubernetes.
-- `kube-public` — публичные ресурсы.
+Namespace — логическое разделение ресурсов в кластере. Как папки на диске: ресурсы с одинаковым именем могут существовать в разных namespace'ах и не мешать друг другу.
+
+Встроенные namespace'ы:
+- `default` — ваши ресурсы попадают сюда, если namespace не указан.
+- `kube-system` — компоненты самого Kubernetes (API Server, DNS, kube-proxy).
+- `kube-public` — публичные ресурсы (обычно пустой).
 
 ```bash
 kubectl get namespaces
-kubectl get pods -n kube-system   # pod'ы Kubernetes-системы
+```
+
+#### Зачем создавать свой namespace
+
+```
+Без namespace'ов:                 С namespace'ами:
+
+default/                          orders-team/
+  order-service                     order-service
+  order-db                          order-db
+  catalog-service                 catalog-team/
+  catalog-db                        catalog-service
+  payment-service                   catalog-db
+  payment-db                      payments-team/
+  test-order-service                payment-service
+  test-catalog-service              payment-db
+  ... 30 ресурсов в куче         staging/
+                                    order-service    ← тот же name, другой NS
+                                    catalog-service
+```
+
+Namespace даёт:
+- **Изоляцию** — `kubectl delete all --all -n staging` удалит staging, не тронув production.
+- **Разграничение доступа** — команде `orders-team` дали права только на свой namespace.
+- **Лимиты ресурсов** — можно ограничить сколько CPU/RAM может потреблять весь namespace.
+- **Одинаковые имена** — `order-service` может существовать и в `staging`, и в `production`.
+
+#### Создание namespace
+
+**Через YAML** (рекомендуется — хранится в Git):
+
+```yaml
+# k8s/00-namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tracker
+```
+
+```bash
+kubectl apply -f k8s/00-namespace.yaml
+```
+
+**Через команду** (быстро, но не версионируется):
+
+```bash
+kubectl create namespace tracker
+```
+
+#### Использование namespace
+
+**Вариант 1: указывать в каждой команде**
+
+```bash
+kubectl get pods -n tracker
+kubectl apply -f k8s/app.yaml -n tracker
+kubectl logs -f deployment/order-service -n tracker
+```
+
+**Вариант 2: переключить контекст** (чтобы не писать `-n` каждый раз)
+
+```bash
+kubectl config set-context --current --namespace=tracker
+
+# Теперь все команды работают в namespace tracker
+kubectl get pods          # показывает Pod'ы из tracker
+kubectl get services      # показывает Service'ы из tracker
+```
+
+**Вариант 3: указать namespace в самом YAML** (самый надёжный)
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  namespace: tracker        # ← ресурс создастся в namespace tracker
+spec:
+  # ...
+```
+
+Если указать namespace в YAML — `kubectl apply -f` всегда положит ресурс в правильное место, даже если вы забыли переключить контекст.
+
+#### DNS между namespace'ами
+
+Pod'ы в одном namespace обращаются друг к другу просто по имени:
+
+```
+http://order-svc:8080
+```
+
+Из **другого** namespace нужно добавить имя namespace:
+
+```
+http://order-svc.tracker:8080
+```
+
+Полный формат (FQDN):
+
+```
+http://order-svc.tracker.svc.cluster.local:8080
+```
+
+#### Посмотреть ресурсы во всех namespace'ах
+
+```bash
+kubectl get pods --all-namespaces
+# или короче
+kubectl get pods -A
 ```
 
 ### Задание
 
 1. Выполните `kubectl get nodes -o wide` — посмотрите информацию об узлах.
 2. Выполните `kubectl get pods -n kube-system` — какие системные компоненты работают?
-3. Выполните `kubectl get namespaces`.
-4. Приложите скриншоты и кратко опишите, что вы видите.
+3. Создайте свой namespace `tracker` (через YAML-файл).
+4. Создайте Pod в namespace `tracker`. Убедитесь, что `kubectl get pods` (без `-n`) его не показывает, а `kubectl get pods -n tracker` — показывает.
+5. Переключите контекст на `tracker` (`kubectl config set-context --current --namespace=tracker`). Убедитесь, что теперь `kubectl get pods` показывает Pod.
+6. Приложите скриншоты.
 
 ---
 
