@@ -2096,65 +2096,207 @@ kubectl set image deployment/tracker-app app=job4j/tracker:2.0
 kubectl rollout status deployment/tracker-app
 ```
 
-### Итоговая структура проекта
+### Организация файлов: куда класть манифесты
+
+Законный вопрос: в Docker Compose один файл на 30 строк, а в Kubernetes — 10+ файлов. Куда их класть? Как не утонуть?
+
+**Правило: папка `k8s/` в корне проекта, по файлу на логическую единицу.**
+
+#### Для простого проекта (1–2 сервиса)
 
 ```
 job4j_tracker/
 ├── src/
 ├── pom.xml
 ├── Dockerfile
+├── compose.yaml               ← для локальной разработки
 └── k8s/
     ├── configmap.yaml
-    ├── postgres.yaml       # PVC + Deployment + Service
-    └── app.yaml            # Deployment + Service
+    ├── secret.yaml
+    ├── postgres.yaml           # PVC + Deployment + Service (через ---)
+    └── app.yaml                # Deployment + Service (через ---)
 ```
 
-### Чек-лист Kubernetes-деплоя
+4 файла. `kubectl apply -f k8s/` — всё поднимается.
 
-- [ ] Dockerfile использует multi-stage build
-- [ ] Образ загружен в minikube (`minikube image load`)
-- [ ] Secret создан для паролей
-- [ ] ConfigMap создан для конфигурации
-- [ ] Deployment с readiness/liveness probes
-- [ ] Resources (requests/limits) указаны
-- [ ] PVC для базы данных
-- [ ] Service для каждого компонента
-- [ ] Labels согласованы между Deployment и Service
+#### Для проекта с несколькими сервисами (микросервисы)
+
+Когда сервисов 5+ — **порядок запуска** важен. Используйте **нумерацию**: `kubectl apply -f k8s/` применяет файлы в алфавитном порядке, номера гарантируют правильную последовательность.
+
+```
+checkdev/
+├── services/
+│   ├── cd_auth/
+│   │   ├── src/
+│   │   └── Dockerfile
+│   ├── cd_desc/
+│   ├── cd_site/
+│   └── ...
+├── compose.yaml
+└── k8s/
+    ├── 00-namespace.yaml          ← сначала namespace
+    ├── 01-secrets.yaml            ← потом секреты
+    ├── 02-configmap.yaml          ← потом конфигурация
+    ├── 10-postgres.yaml           ← потом БД (Deployment + Service + PVC)
+    ├── 11-kafka.yaml              ← потом брокер
+    ├── 20-eureka.yaml             ← потом service discovery
+    ├── 30-auth.yaml               ← потом бизнес-сервисы
+    ├── 31-desc.yaml
+    ├── 32-generator.yaml
+    ├── 33-mock.yaml
+    ├── 40-site.yaml               ← потом фронт/агрегаторы
+    ├── 41-notification.yaml
+    └── 50-ingress.yaml            ← в конце маршрутизация
+```
+
+Логика нумерации:
+
+```
+00-09  namespace, secrets, configmaps    ← конфигурация (нет зависимостей)
+10-19  postgres, kafka                   ← инфраструктура (нужна конфигурация)
+20-29  eureka                            ← service discovery (нужна инфраструктура)
+30-39  auth, desc, generator, mock       ← бизнес-сервисы (нужны БД + eureka)
+40-49  site, notification                ← зависят от других сервисов
+50-59  ingress                           ← маршрутизация (нужны все сервисы)
+```
+
+#### Один файл = один сервис
+
+Каждый файл содержит **всё** для одного сервиса — Deployment + Service через `---`:
+
+```yaml
+# k8s/30-auth.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth
+  namespace: checkdev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: auth
+  template:
+    metadata:
+      labels:
+        app: auth
+    spec:
+      containers:
+        - name: auth
+          image: checkdev/cd_auth:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 9900
+          envFrom:
+            - configMapRef:
+                name: checkdev-config
+            - secretRef:
+                name: checkdev-secrets
+          env:
+            - name: SERVER_PORT
+              value: "9900"
+            - name: SPRING_DATASOURCE_URL
+              value: "jdbc:postgresql://postgres-svc:5432/cd_auth"
+            - name: EUREKA_CLIENT_SERVICE_URL_DEFAULTZONE
+              value: "http://eureka-svc:9009/eureka"
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 9900
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 9900
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-svc
+  namespace: checkdev
+spec:
+  selector:
+    app: auth
+  ports:
+    - port: 9900
+      targetPort: 9900
+```
+
+Открыл `30-auth.yaml` — видишь **всё** про auth: образ, порты, env, probes, service. Не надо искать по трём разным файлам.
+
+#### Деплой — одна команда
+
+```bash
+# Всё сразу (файлы применятся в алфавитном порядке → по номерам)
+kubectl apply -f k8s/
+
+# Конкретный сервис (перезапустить только auth)
+kubectl apply -f k8s/30-auth.yaml
+
+# Удалить всё
+kubectl delete -f k8s/
+```
+
+#### Почему не файл в каждом модуле?
+
+```
+❌ services/cd_auth/k8s/deployment.yaml
+   services/cd_desc/k8s/deployment.yaml
+```
+
+Общую инфраструктуру (postgres, kafka) некуда положить. `kubectl apply` нужно вызывать 7 раз из разных папок. Порядок запуска не очевиден.
+
+#### Почему не всё в одном файле?
+
+```
+❌ k8s/all.yaml  (500+ строк)
+```
+
+Невозможно читать, невозможно дифать в Git-ревью. «Поменял env у auth» — в diff'е 500 строк.
 
 ### «Стопка файлов» — Docker Compose vs Kubernetes
 
-Законный вопрос: в Docker Compose один файл на 30 строк, а в Kubernetes — 8 файлов на 200 строк. Зачем?
-
-**Docker Compose** решает одну задачу: «подними контейнеры на одной машине». Один файл — достаточно.
-
-**Kubernetes** решает десять задач: запуск, масштабирование, отказоустойчивость, сеть, хранение, конфигурация, секреты, обновления, мониторинг, маршрутизация. Каждая задача — отдельный ресурс — отдельный (или объединённый через `---`) YAML.
+Docker Compose — один файл, потому что одна задача: «подними контейнеры». Kubernetes — 10+ файлов, потому что десять задач: запуск, масштабирование, отказоустойчивость, сеть, хранение, конфигурация, секреты, обновления, мониторинг, маршрутизация.
 
 Но в реальности **никто не пишет все YAML руками каждый раз**:
 
 | Этап | Как работают с YAML |
 |------|-------------------|
-| **Учёба** | Пишем руками, 5–8 файлов. Это нормально — нужно понять, что делает каждый ресурс. |
-| **Средний проект** | **Helm** — шаблонизатор. Один раз написал шаблон, дальше `helm install my-app ./chart --set replicas=3` генерирует все файлы автоматически. |
-| **Большая компания** | Вообще не пишешь K8s-манифесты. Платформенная команда дала шаблон. Ты заполняешь `values.yaml` на 15 строк. CI/CD генерирует всё остальное. |
+| **Учёба** | Пишем руками, нумерованные файлы в `k8s/`. Нужно понять, что делает каждый ресурс. |
+| **Средний проект** | **Helm** — один шаблон, `helm install my-app ./chart --set replicas=3` генерирует все файлы. |
+| **Большая компания** | Платформенная команда дала шаблон. Ты заполняешь `values.yaml` на 15 строк. CI/CD делает остальное. |
 
-Наш проект в Helm-формате выглядел бы так:
+Не переходите на Helm, пока не почувствуете боль от дублирования. Преждевременная абстракция хуже дублирования.
 
-```bash
-# Вместо 8 kubectl apply:
-helm install tracker ./tracker-chart \
-  --set image.tag=1.0 \
-  --set replicas=3 \
-  --set db.password=secret
-```
+### Чек-лист Kubernetes-деплоя
 
-Одна команда — и все Deployment, Service, ConfigMap, Secret, PVC, Ingress созданы. Helm мы разобрали в уроке 9.
+- [ ] Dockerfile использует multi-stage build
+- [ ] Образ загружен в minikube (`minikube image load`)
+- [ ] Secret создан для паролей (не в Git!)
+- [ ] ConfigMap создан для конфигурации
+- [ ] Deployment с readiness/liveness probes
+- [ ] Resources (requests/limits) указаны
+- [ ] PVC для базы данных
+- [ ] Service для каждого компонента
+- [ ] Labels согласованы между Deployment и Service selector
+- [ ] Файлы в `k8s/` пронумерованы в порядке зависимостей
 
 ### Задание
 
 1. Создайте Dockerfile для вашего Spring Boot проекта (job4j_tracker или CheckDev).
 2. Загрузите образ в minikube.
-3. Создайте все необходимые Kubernetes-манифесты (Secret, ConfigMap, PVC, Deployments, Services).
-4. Задеплойте приложение и БД в кластер.
+3. Создайте папку `k8s/` с пронумерованными манифестами.
+4. Задеплойте всё одной командой: `kubectl apply -f k8s/`.
 5. Убедитесь:
    - Приложение доступно через `minikube service` или `port-forward`.
    - После удаления Pod'а PostgreSQL данные сохраняются.
