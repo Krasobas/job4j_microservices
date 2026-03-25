@@ -49,14 +49,15 @@ services:
       start_period: 60s
 
   agent1:
-    build: ./agent
+    build:
+      context: ./agent
+      args:
+        DOCKER_GID: ${DOCKER_GID}
     container_name: agent1
     environment:
       - JENKINS_AGENT_SSH_PUBKEY=${JENKINS_SSH_PUBKEY}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    group_add:
-      - ${DOCKER_GID}
     depends_on:
       jenkins:
         condition: service_healthy
@@ -71,14 +72,15 @@ networks:
   jenkins-net:
 ```
 
-`group_add` — добавляет GID группы docker с хоста к процессу контейнера на уровне runtime. Это аналог `--group-add` в `docker run`. Никаких `groupadd`/`usermod` внутри Dockerfile не нужно — Compose делает всё сам.
-
 **agent/Dockerfile:**
 
 ```dockerfile
 FROM jenkins/ssh-agent:jdk21
 
 USER root
+
+# Docker CLI + BuildKit из официального репозитория Docker.
+# Пакет docker.io из Debian не содержит CLI — нужен docker-ce-cli.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates curl && \
     install -m 0755 -d /etc/apt/keyrings && \
@@ -89,11 +91,23 @@ RUN apt-get update && \
       https://download.docker.com/linux/debian bookworm stable" \
       > /etc/apt/sources.list.d/docker.list && \
     apt-get update && \
-    apt-get install -y --no-install-recommends docker-ce-cli && \
+    apt-get install -y --no-install-recommends \
+      docker-ce-cli \
+      docker-buildx-plugin && \
     rm -rf /var/lib/apt/lists/*
+
+# Добавляем jenkins в группу docker хоста.
+# GID передаётся через build arg, чтобы совпал с владельцем docker.sock.
+ARG DOCKER_GID
+RUN groupadd -g ${DOCKER_GID} dockerhost 2>/dev/null; \
+    usermod -aG $(getent group ${DOCKER_GID} | cut -d: -f1) jenkins
 ```
 
-Устанавливаем `docker-ce-cli` из официального репозитория Docker — это только CLI, без daemon'а. Пакет `docker.io` из Debian-репозитория в актуальных версиях не содержит CLI-бинарник, поэтому использовать его не стоит.
+> **Почему нет `USER jenkins` в конце?** Образ `jenkins/ssh-agent` запускает entrypoint от root — он настраивает SSH-ключи, пишет в `/etc/environment`, а потом сам переключается на пользователя jenkins. Если добавить `USER jenkins`, entrypoint сломается.
+>
+> **Почему `docker-ce-cli`, а не `docker.io`?** Пакет `docker.io` из Debian-репозитория в актуальных версиях содержит только daemon (`dockerd`), но не CLI-бинарник `docker`. Нужен `docker-ce-cli` из официального репозитория Docker.
+>
+> **Почему `docker-buildx-plugin`?** Без него Docker использует legacy builder и выдаёт предупреждение. BuildKit (через buildx) — современный движок сборки, который работает быстрее и поддерживает параллельные multi-stage сборки.
 
 **.env:**
 
@@ -129,7 +143,7 @@ volumes:
 
 Docker socket (`/var/run/docker.sock`) — это Unix-сокет, через который Docker CLI общается с Docker Daemon. Пробросив его в контейнер агента, мы даём агенту возможность управлять Docker'ом на хосте.
 
-Но пробросить файл мало — процессу внутри контейнера нужны права на чтение/запись в этот сокет. На хосте сокет принадлежит группе `docker` с определённым GID (обычно 999). Именно поэтому в `compose.yaml` мы указываем `group_add: - ${DOCKER_GID}` — это добавляет GID группы docker с хоста к процессу jenkins внутри контейнера.
+Но пробросить файл мало — процессу внутри контейнера нужны права на чтение/запись в этот сокет. На хосте сокет принадлежит группе `docker` с определённым GID (например, 988). Именно поэтому в `agent/Dockerfile` мы создаём группу с тем же GID и добавляем в неё пользователя jenkins.
 
 ```
 ┌──────────────────────────────────────────┐
