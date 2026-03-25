@@ -80,12 +80,20 @@ FROM jenkins/ssh-agent:jdk21
 
 USER root
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends docker.io && \
+    apt-get install -y --no-install-recommends ca-certificates curl && \
+    install -m 0755 -d /etc/apt/keyrings && \
+    curl -fsSL https://download.docker.com/linux/debian/gpg \
+      -o /etc/apt/keyrings/docker.asc && \
+    echo "deb [arch=$(dpkg --print-architecture) \
+      signed-by=/etc/apt/keyrings/docker.asc] \
+      https://download.docker.com/linux/debian bookworm stable" \
+      > /etc/apt/sources.list.d/docker.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends docker-ce-cli && \
     rm -rf /var/lib/apt/lists/*
-USER jenkins
 ```
 
-Dockerfile минимальный — только устанавливает Docker CLI. Права на docker.sock настраиваются через `group_add` в `compose.yaml`, а не через `groupadd`/`usermod` в Dockerfile. Так проще, надёжнее и нет проблем с несовпадением GID между хостом и контейнером.
+Устанавливаем `docker-ce-cli` из официального репозитория Docker — это только CLI, без daemon'а. Пакет `docker.io` из Debian-репозитория в актуальных версиях не содержит CLI-бинарник, поэтому использовать его не стоит.
 
 **.env:**
 
