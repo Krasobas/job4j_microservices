@@ -49,15 +49,14 @@ services:
       start_period: 60s
 
   agent1:
-    build:
-      context: ./agent
-      args:
-        DOCKER_GID: ${DOCKER_GID}
+    build: ./agent
     container_name: agent1
     environment:
       - JENKINS_AGENT_SSH_PUBKEY=${JENKINS_SSH_PUBKEY}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - ${DOCKER_GID}
     depends_on:
       jenkins:
         condition: service_healthy
@@ -72,27 +71,21 @@ networks:
   jenkins-net:
 ```
 
+`group_add` — добавляет GID группы docker с хоста к процессу контейнера на уровне runtime. Это аналог `--group-add` в `docker run`. Никаких `groupadd`/`usermod` внутри Dockerfile не нужно — Compose делает всё сам.
+
 **agent/Dockerfile:**
 
 ```dockerfile
 FROM jenkins/ssh-agent:jdk21
 
-# Устанавливаем Docker CLI, чтобы агент мог вызывать docker build
 USER root
 RUN apt-get update && \
     apt-get install -y --no-install-recommends docker.io && \
     rm -rf /var/lib/apt/lists/*
-
-# Добавляем пользователя jenkins в группу docker.
-# GID берём с хост-машины, чтобы совпали права на docker.sock.
-ARG DOCKER_GID
-RUN groupadd -g ${DOCKER_GID} dockerhost || true && \
-    usermod -aG ${DOCKER_GID} jenkins
-
 USER jenkins
 ```
 
-> **Зачем отдельный Dockerfile для агента?** Базовый образ `jenkins/ssh-agent:jdk21` не содержит Docker CLI. Нам нужно его доустановить и настроить права. Это как раз задача для Dockerfile — воспроизводимо, версионируемо, без ручных команд.
+Dockerfile минимальный — только устанавливает Docker CLI. Права на docker.sock настраиваются через `group_add` в `compose.yaml`, а не через `groupadd`/`usermod` в Dockerfile. Так проще, надёжнее и нет проблем с несовпадением GID между хостом и контейнером.
 
 **.env:**
 
@@ -127,6 +120,8 @@ volumes:
 ```
 
 Docker socket (`/var/run/docker.sock`) — это Unix-сокет, через который Docker CLI общается с Docker Daemon. Пробросив его в контейнер агента, мы даём агенту возможность управлять Docker'ом на хосте.
+
+Но пробросить файл мало — процессу внутри контейнера нужны права на чтение/запись в этот сокет. На хосте сокет принадлежит группе `docker` с определённым GID (обычно 999). Именно поэтому в `compose.yaml` мы указываем `group_add: - ${DOCKER_GID}` — это добавляет GID группы docker с хоста к процессу jenkins внутри контейнера.
 
 ```
 ┌──────────────────────────────────────────┐
@@ -312,7 +307,73 @@ pipeline {
 
 ### Пуш образа в Registry
 
-Собранный образ живёт только на хосте. Чтобы его использовать на production-сервере — нужно залить в registry:
+Собранный образ живёт только на хосте. Чтобы его использовать на production-сервере — нужно залить в registry. Разберём по шагам.
+
+#### Шаг 1: Регистрация на Docker Hub
+
+Docker Hub — публичный registry по умолчанию. Бесплатный план позволяет хранить неограниченное количество публичных образов и один приватный.
+
+1. Перейдите на https://hub.docker.com и нажмите **Sign Up**.
+2. Заполните: username, email, пароль.
+3. Подтвердите email.
+
+Ваш username — это namespace для образов. Если username = `petrov`, образы будут называться `petrov/job4j_devops:latest`.
+
+> **Другие registry**: Docker Hub — не единственный вариант. GitHub Container Registry (`ghcr.io`), GitLab Registry, Yandex Container Registry — всё это работает по тому же принципу. Мы используем Docker Hub как самый простой для начала.
+
+#### Шаг 2: Создание Access Token
+
+Не используйте пароль от аккаунта для CI. Создайте отдельный токен с ограниченными правами:
+
+1. Docker Hub → **Account Settings** → **Personal access tokens** → **Generate new token**
+2. Description: `jenkins-ci` (чтобы потом понимать, для чего токен)
+3. Access permissions: **Read & Write** (достаточно для push/pull)
+4. Нажмите **Generate**, скопируйте токен — он покажется только один раз
+
+> **Почему токен, а не пароль?** Токен можно отозвать, не меняя пароль от аккаунта. Если Jenkins скомпрометирован — отзываете токен, создаёте новый. Аккаунт остаётся в безопасности.
+
+#### Шаг 3: Проверка с локальной машины
+
+Прежде чем настраивать Jenkins, убедитесь, что всё работает:
+
+```bash
+# Логин (вместо пароля — токен)
+docker login -u <ваш_username>
+# Password: <вставляете токен>
+
+# Тегируем образ (формат: username/имя:тег)
+docker tag job4j_devops:latest <ваш_username>/job4j_devops:latest
+
+# Пушим
+docker push <ваш_username>/job4j_devops:latest
+
+# Проверяем — образ появился на Docker Hub
+# https://hub.docker.com/r/<ваш_username>/job4j_devops
+#
+# Репозиторий создавать вручную НЕ нужно —
+# Docker Hub создаст его автоматически при первом push (публичный).
+# Если нужен приватный — тогда сначала создайте через UI:
+# Docker Hub → Repositories → Create Repository → Private
+
+# Выходим
+docker logout
+```
+
+#### Шаг 4: Сохранение учётных данных в Jenkins
+
+Учётные данные хранятся в Jenkins Credentials — зашифрованном хранилище. Никогда не пишите токены в Jenkinsfile или `.env`.
+
+1. Jenkins → **Manage Jenkins** → **Credentials**
+2. Выберите домен (обычно **Global**) → **Add Credentials**
+3. Заполните:
+   - **Kind**: Username with password
+   - **Username**: ваш Docker Hub username
+   - **Password**: токен (не пароль от аккаунта!)
+   - **ID**: `dockerhub-creds` (это ID, по которому Jenkinsfile будет обращаться к учётным данным)
+   - **Description**: `Docker Hub Access Token`
+4. Нажмите **Create**
+
+#### Шаг 5: Этап push в Jenkinsfile
 
 ```groovy
 stage('Docker Push') {
@@ -335,7 +396,14 @@ stage('Docker Push') {
 }
 ```
 
-Пароль хранится в Jenkins Credentials, не в Jenkinsfile. `--password-stdin` передаёт пароль через pipe — он не попадёт в логи или `ps aux`.
+Разберём:
+
+- `withCredentials` — Jenkins подставляет логин и токен в переменные окружения `DOCKER_USER` и `DOCKER_PASS`. Они существуют только внутри этого блока.
+- `credentialsId: 'dockerhub-creds'` — тот самый ID из шага 4.
+- `echo $DOCKER_PASS | docker login --password-stdin` — передаёт токен через pipe. Если написать `docker login -u user -p password`, пароль попадёт в `ps aux` и в логи Jenkins. `--password-stdin` это предотвращает.
+- `docker tag` — Docker Hub требует формат `username/image:tag`. Локальный образ `job4j_devops:42` переименовывается в `petrov/job4j_devops:42`.
+- Два тега: `${BUILD_NUMBER}` (для отката на конкретную версию) и `latest` (удобный указатель на последнюю).
+- `docker logout` — удаляет сохранённый токен с агента после пуша.
 
 ### Полный пайплайн
 
@@ -362,8 +430,10 @@ Production pulls new image
 
 ### Задание
 
-1. Создайте директорию `jenkins-infra` с `compose.yaml` и `agent/Dockerfile` по примеру из урока.
-2. Запустите Jenkins через `docker compose up -d`.
-3. Настройте агент в Jenkins (Manage Jenkins → Nodes → New Node).
-4. В проекте job4j_devops добавьте Jenkinsfile с этапом Docker Build.
-5. Запустите сборку. Приложите скриншот успешного этапа Docker Build.
+1. Зарегистрируйтесь на Docker Hub, если ещё нет аккаунта.
+2. Создайте Access Token с правами Read & Write.
+3. С локальной машины: соберите образ, залогиньтесь, запушьте образ на Docker Hub. Убедитесь, что он появился в вашем аккаунте. Приложите скриншот страницы образа на Docker Hub.
+4. Создайте директорию `jenkins-infra` с `compose.yaml` и `agent/Dockerfile` по примеру из урока. Запустите Jenkins через `docker compose up -d`.
+5. Добавьте Docker Hub credentials в Jenkins (Manage Jenkins → Credentials).
+6. В проекте job4j_devops добавьте Jenkinsfile с этапами Docker Build и Docker Push.
+7. Запустите сборку. Приложите скриншот успешного пайплайна и ссылку на образ в Docker Hub.
