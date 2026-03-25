@@ -21,7 +21,9 @@ jenkins-infra/
 ├── compose.yaml
 ├── agent/
 │   └── Dockerfile
-└── .env
+├── .env              ← не коммитить! добавьте в .gitignore
+├── .env.example      ← шаблон с пустыми значениями (коммитить)
+└── .gitignore
 ```
 
 **compose.yaml:**
@@ -39,6 +41,12 @@ services:
     networks:
       - jenkins-net
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/login"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
 
   agent1:
     build:
@@ -50,6 +58,9 @@ services:
       - JENKINS_AGENT_SSH_PUBKEY=${JENKINS_SSH_PUBKEY}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      jenkins:
+        condition: service_healthy
     networks:
       - jenkins-net
     restart: unless-stopped
@@ -95,6 +106,8 @@ DOCKER_GID=999
 JENKINS_SSH_PUBKEY=ssh-rsa AAAA...
 ```
 
+> **Напоминание из Урока 10**: `.env` содержит чувствительные данные — **не коммитьте** его в Git. Добавьте в `.gitignore`. Вместо этого создайте файл `.env.example` с пустыми значениями — он покажет коллегам, какие переменные нужно заполнить.
+
 **Запуск:**
 
 ```bash
@@ -136,21 +149,22 @@ Docker socket (`/var/run/docker.sock`) — это Unix-сокет, через к
 
 > **Важно про безопасность**: доступ к Docker socket = root-доступ к хосту. Контейнер с socket'ом может запустить `docker run -v /:/host ubuntu rm -rf /host`. Пробрасывайте socket только доверенным контейнерам.
 
-### Dockerfile проекта — один на все случаи
+### Dockerfile проекта: два подхода
 
-Частый вопрос: «нужен ли отдельный Dockerfile для CI?» Нет. Dockerfile один, лежит в корне проекта — рядом с `build.gradle.kts` или `pom.xml`:
+Есть два подхода, оба валидны. Выбор зависит от того, что делает ваш пайплайн.
+
+**Подход 1: Один Dockerfile (самодостаточный)**
+
+Dockerfile содержит multi-stage сборку. Jenkins просто вызывает `docker build` — вся сборка происходит внутри Docker:
 
 ```
 job4j_devops/
 ├── src/
 ├── build.gradle.kts
-├── settings.gradle.kts
-├── Dockerfile            ← вот он
+├── Dockerfile            ← полный, с этапом сборки
 ├── compose.yaml
 └── .dockerignore
 ```
-
-Это тот же Dockerfile из Урока 9 — с multi-stage сборкой:
 
 ```dockerfile
 FROM gradle:8.12-jdk21 AS build
@@ -159,7 +173,7 @@ COPY build.gradle.kts settings.gradle.kts gradle.properties ./
 COPY gradle/libs.versions.toml ./gradle/
 RUN gradle --no-daemon dependencies
 COPY src ./src
-RUN gradle --no-daemon clean build -x test
+RUN gradle --no-daemon clean build
 
 FROM eclipse-temurin:21-jre
 WORKDIR /app
@@ -168,11 +182,48 @@ EXPOSE 8080
 ENTRYPOINT ["java", "-jar", "app.jar"]
 ```
 
-Когда Jenkins вызывает `docker build`, Docker сам выполняет всю сборку внутри контейнера — скачивает зависимости, компилирует, собирает JAR, и упаковывает в минимальный образ. Jenkins'у не нужно знать ничего про Gradle или Java.
+Плюс: Dockerfile работает везде одинаково — на ноутбуке, в CI, на любом сервере. Один файл — один результат. Тесты гарантированно прогоняются при каждой сборке.
+Минус: если Jenkins уже собрал JAR и прогнал тесты, Docker повторит эту работу заново.
 
-> **А если Jenkins уже собрал JAR на предыдущем этапе?** Это нормально — Docker пересоберёт в своём контейнере. Да, двойная работа. Но зато Dockerfile самодостаточный: он работает и в CI, и у разработчика на ноутбуке, и в любом другом месте. Один Dockerfile — один результат. Это ценнее, чем экономия минуты на сборке.
+**Подход 2: Два Dockerfile (CI упаковывает готовый артефакт)**
+
+Jenkins собирает JAR, прогоняет тесты. Отдельный Dockerfile только упаковывает готовый артефакт:
+
+```
+job4j_devops/
+├── src/
+├── build.gradle.kts
+├── Dockerfile            ← для разработчика (полный, с multi-stage)
+├── jenkins/
+│   └── Dockerfile        ← для CI (только упаковка)
+├── compose.yaml
+└── .dockerignore
+```
+
+`jenkins/Dockerfile`:
+
+```dockerfile
+FROM eclipse-temurin:21-jre
+WORKDIR /app
+COPY build/libs/*.jar app.jar
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "app.jar"]
+```
+
+В Jenkinsfile:
+
+```groovy
+sh 'docker build -f jenkins/Dockerfile -t job4j_devops:${BUILD_NUMBER} .'
+```
+
+Плюс: CI не тратит время на повторную сборку, пайплайн быстрее.
+Минус: два Dockerfile нужно поддерживать. Обновил базовый образ в одном — не забудь обновить в другом.
+
+> **Рекомендация**: для учебных проектов используйте подход 1 — проще. Для production-проектов с развитым CI — подход 2 экономит минуты на каждой сборке.
 
 ### Jenkinsfile
+
+**Подход 1** — самодостаточный Dockerfile, Jenkins только запускает `docker build`:
 
 ```groovy
 pipeline {
@@ -207,7 +258,55 @@ pipeline {
 }
 ```
 
-Обратите внимание: Jenkins **не вызывает** `gradle build` отдельно. Dockerfile всё делает сам. Пайплайн максимально простой: checkout → docker build.
+Тесты здесь запускаются **внутри** `docker build` (в этапе `RUN gradle clean build`). Если тесты упадут — сборка образа тоже упадёт.
+
+**Подход 2** — Jenkins тестирует и собирает JAR, Docker только упаковывает:
+
+```groovy
+pipeline {
+    agent { label 'agent1' }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch: 'main',
+                    url: 'https://github.com/your/job4j_devops.git'
+            }
+        }
+        stage('Test') {
+            steps {
+                sh 'chmod +x ./gradlew'
+                sh './gradlew check'
+            }
+        }
+        stage('Build JAR') {
+            steps {
+                sh './gradlew build'
+            }
+        }
+        stage('Docker Build') {
+            steps {
+                sh 'docker build -f jenkins/Dockerfile -t job4j_devops:${BUILD_NUMBER} .'
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                def info = """
+                    Build: ${currentBuild.number}
+                    Status: ${currentBuild.currentResult}
+                    Duration: ${currentBuild.durationString}
+                """
+                echo info
+            }
+        }
+    }
+}
+```
+
+Обратите внимание на `-f jenkins/Dockerfile` — указываем путь к CI-версии Dockerfile.
 
 Тег `${BUILD_NUMBER}` — номер сборки Jenkins. Каждый образ получает уникальный тег: `job4j_devops:1`, `job4j_devops:2`, `job4j_devops:3`... Это позволяет откатиться на любую версию.
 
@@ -247,11 +346,13 @@ Developer pushes to Git
 Jenkins detects change (webhook)
         │
         ▼
-┌─ Pipeline ─────────────────────┐
-│  1. Checkout                   │
-│  2. Docker Build               │  ← Dockerfile делает всю сборку
-│  3. Docker Push to Registry    │
-└────────────────────────────────┘
+┌─ Подход 1 ──────────────────────┐  ┌─ Подход 2 ──────────────────────┐
+│  1. Checkout                    │  │  1. Checkout                    │
+│  2. Docker Build                │  │  2. Test (gradlew check)        │
+│     (тесты + сборка внутри)     │  │  3. Build JAR (gradlew build)   │
+│  3. Docker Push to Registry     │  │  4. Docker Build (-f jenkins/)  │
+└─────────────────────────────────┘  │  5. Docker Push to Registry     │
+                                     └─────────────────────────────────┘
         │
         ▼
 Production pulls new image
