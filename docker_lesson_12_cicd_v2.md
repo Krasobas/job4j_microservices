@@ -58,6 +58,7 @@ services:
       - JENKINS_AGENT_SSH_PUBKEY=${JENKINS_SSH_PUBKEY}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - agent1_gradle_cache:/home/jenkins/.gradle
     depends_on:
       jenkins:
         condition: service_healthy
@@ -67,10 +68,13 @@ services:
 
 volumes:
   jenkins_home:
+  agent1_gradle_cache:
 
 networks:
   jenkins-net:
 ```
+
+Том `agent1_gradle_cache` сохраняет кэш Gradle между перезапусками контейнера: скачанный дистрибутив Gradle, зависимости проекта и кэш сборок. Без этого тома каждая сборка будет заново скачивать Gradle (~130МБ) и все зависимости.
 
 **agent/Dockerfile:**
 
